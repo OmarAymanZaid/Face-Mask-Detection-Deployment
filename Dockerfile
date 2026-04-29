@@ -11,9 +11,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY requirements.txt .
-COPY requirements_docker.txt .
 
 RUN pip install --upgrade pip
+COPY requirements_docker.txt .
 RUN pip install --no-cache-dir -r requirements_docker.txt
 
 COPY . .
