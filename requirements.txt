@@ -1,0 +1,13 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
+opencv-python
+pillow
+matplotlib
+scikit-learn
+kagglehub
+seaborn
+fastapi
+uvicorn[standard]
+python-multipart
+streamlit
