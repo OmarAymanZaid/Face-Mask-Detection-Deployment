@@ -5,11 +5,16 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - MODEL_PATH=/app/models/best_model_NO_AUG.pth
+      - USE_AWS=true
+      - AWS_REGION=eu-north-1
+      - S3_BUCKET=face-mask-audit-trail-om-44
+      - DYNAMO_TABLE=mask-detections
+      - CW_NAMESPACE=FaceMaskDetection
+
   streamlit:
     image: face-mask-image
     command: streamlit run app/streamlit_app.py --server.port 8501 --server.address 0.0.0.0
     ports:
       - "8501:8501"
     environment:
-    - API_URL=http://mask-detection-api:8000/predict
+      - API_URL=http://mask-detection-api:8000/predict
