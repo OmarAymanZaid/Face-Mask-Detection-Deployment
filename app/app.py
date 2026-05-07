@@ -119,24 +119,46 @@ def save_frame_to_s3(raw_bytes: bytes, detection_id: str) -> str | None:
 def log_to_dynamodb(item: dict):
     """Write inference metadata to DynamoDB using explicit type descriptors."""
     if not USE_AWS:
+        print("[DEBUG] AWS disabled — skipping DynamoDB write.")
         return
+
+    # Explicit Python-type casts before building the DynamoDB item.
+    # This guarantees no silent type mismatch regardless of what
+    # arrived in the dict (e.g. numpy float32 instead of Python float).
+    detection_id  = str(item["detection_id"])
+    timestamp     = str(item["timestamp"])
+    cls           = str(item["class"])
+    status        = str(item["status"])
+    confidence    = float(item["confidence"])      # numpy float32 → Python float
+    action        = str(item["action"])
+    review_status = str(item["review_status"])
+    needs_review  = bool(item["needs_review"])     # explicit bool cast
+    s3_key        = str(item["s3_key"]) if item["s3_key"] else "local"
+    latency_ms    = float(item["latency_ms"])
+    device        = str(item["device"])
+
+    dynamo_item = {
+        "detection_id":  {"S": detection_id},
+        "timestamp":     {"S": timestamp},
+        "class":         {"S": cls},
+        "status":        {"S": status},
+        "confidence":    {"N": str(confidence)},   # N type must be a string
+        "action":        {"S": action},
+        "review_status": {"S": review_status},
+        "needs_review":  {"BOOL": needs_review},   # native DynamoDB boolean
+        "s3_key":        {"S": s3_key},
+        "latency_ms":    {"N": str(latency_ms)},
+        "device":        {"S": device},
+    }
+
+    print(f"[DEBUG] Writing to DynamoDB: {dynamo_item}")
+
     try:
         aws["dynamodb_client"].put_item(
             TableName=DYNAMO_TABLE,
-            Item={
-                "detection_id":  {"S": item["detection_id"]},
-                "timestamp":     {"S": item["timestamp"]},
-                "class":         {"S": item["class"]},
-                "status":        {"S": item["status"]},
-                "confidence":    {"N": str(item["confidence"])},
-                "action":        {"S": item["action"]},
-                "review_status": {"S": item["review_status"]},
-                "needs_review":  {"BOOL": item["needs_review"]},
-                "s3_key":        {"S": item["s3_key"] or "local"},
-                "latency_ms":    {"N": str(item["latency_ms"])},
-                "device":        {"S": item["device"]},
-            }
+            Item=dynamo_item,
         )
+        print(f"[DEBUG] DynamoDB write succeeded for detection_id={detection_id}")
     except Exception as exc:
         print(f"[ERROR] DynamoDB put_item failed: {exc}")
         raise
@@ -248,17 +270,21 @@ async def predict(file: UploadFile = File(..., description="Face image (JPEG/PNG
         probs  = torch.softmax(logits, dim=1)[0]
 
     predicted_idx   = int(probs.argmax())
-    predicted_class = CLASSES[predicted_idx]
-    confidence      = float(probs[predicted_idx])
-    latency_ms      = (time.perf_counter() - t_start) * 1000
+    predicted_class = str(CLASSES[predicted_idx])
+    confidence      = float(probs[predicted_idx])   # force Python float — not numpy
+    latency_ms      = float((time.perf_counter() - t_start) * 1000)
     timestamp       = datetime.now(timezone.utc).isoformat()
 
     all_probs = {cls: round(float(p), 4) for cls, p in zip(CLASSES, probs)}
 
     # ── Confidence-based routing ──────────────────────────────────
+    # Read the module-level constant explicitly — no local shadowing possible
+    threshold = float(CONFIDENCE_THRESHOLD)
     base_status = "mask_on" if predicted_class == "WithMask" else "mask_off"
 
-    if confidence >= CONFIDENCE_THRESHOLD:
+    print(f"[DEBUG] predicted_class={predicted_class}, confidence={confidence:.4f}, threshold={threshold}")
+
+    if confidence >= threshold:
         action        = "Allow entry"
         review_status = "automated"
         needs_review  = False
@@ -267,7 +293,10 @@ async def predict(file: UploadFile = File(..., description="Face image (JPEG/PNG
         review_status = "pending_review"
         needs_review  = True
 
-    # ── Single result dict — shared by AWS logging and response ───
+    # ── Build result dict BEFORE AWS calls ────────────────────────
+    # s3_key starts as None and is updated in-place after the upload.
+    # log_to_dynamodb is called AFTER save_frame_to_s3 so s3_key is
+    # already in the dict when DynamoDB receives it.
     result = {
         "detection_id":      detection_id,
         "timestamp":         timestamp,
@@ -283,10 +312,12 @@ async def predict(file: UploadFile = File(..., description="Face image (JPEG/PNG
         "device":            str(DEVICE),
     }
 
-    # ── AWS side-effects (non-blocking best-effort) ───────────────
+    print(f"[DEBUG] Action={action}, Confidence={confidence:.4f}, needs_review={needs_review}")
+
+    # ── AWS side-effects (sequential — s3_key must exist before DDB write)
     try:
-        result["s3_key"] = save_frame_to_s3(raw, detection_id)
-        log_to_dynamodb(result)
+        result["s3_key"] = save_frame_to_s3(raw, detection_id)  # updates dict in-place
+        log_to_dynamodb(result)                                  # reads updated s3_key
         push_cloudwatch_metrics(predicted_class, latency_ms)
     except Exception as exc:
         print(f"[WARN] AWS logging failed: {exc}")
