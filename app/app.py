@@ -26,11 +26,8 @@ BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.abspath(os.path.join(BASE_DIR, "..", "models", "best_model_NO_AUG.pth"))
 DEVICE     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-CLASSES = ["WithMask", "WithoutMask"]
-ACTION_MAP = {
-    "WithMask":    {"status": "mask_on",  "action": "Allow entry"},
-    "WithoutMask": {"status": "mask_off", "action": "Deny entry"},
-}
+CLASSES              = ["WithMask", "WithoutMask"]
+CONFIDENCE_THRESHOLD = 0.85
 
 # ── AWS config — all driven by environment variables ──────────────
 USE_AWS      = os.getenv("USE_AWS", "false").lower() == "true"
@@ -40,20 +37,20 @@ DYNAMO_TABLE = os.getenv("DYNAMO_TABLE", "mask-detections")
 CW_NAMESPACE = os.getenv("CW_NAMESPACE", "FaceMaskDetection")
 
 # ── DNN face detector paths ───────────────────────────────────────
-PROTOTXT_PATH   = os.path.join(BASE_DIR, "deploy.prototxt")
-CAFFEMODEL_PATH = os.path.join(BASE_DIR, "res10_300x300_ssd_iter_140000_fp16.caffemodel")
+PROTOTXT_PATH             = os.path.join(BASE_DIR, "deploy.prototxt")
+CAFFEMODEL_PATH           = os.path.join(BASE_DIR, "res10_300x300_ssd_iter_140000_fp16.caffemodel")
 FACE_CONFIDENCE_THRESHOLD = 0.5
 
 # ──────────────────────────────────────────────
-# AWS clients (lazy — only created when USE_AWS=true)
+# AWS clients
 # Credentials come from the IAM Instance Role — no keys needed.
 # ──────────────────────────────────────────────
 def get_aws_clients():
     session = boto3.Session(region_name=AWS_REGION)
     return {
-        "s3":        session.client("s3"),
-        "dynamodb":  session.resource("dynamodb"),
-        "cloudwatch": session.client("cloudwatch"),
+        "s3":              session.client("s3"),
+        "dynamodb_client": session.client("dynamodb"),   # low-level client — explicit types
+        "cloudwatch":      session.client("cloudwatch"),
     }
 
 aws = {}
@@ -119,22 +116,30 @@ def save_frame_to_s3(raw_bytes: bytes, detection_id: str) -> str | None:
     return key
 
 
-def log_to_dynamodb(detection_id: str, predicted_class: str,
-                    confidence: float, s3_key: str | None, latency_ms: float):
-    """Write inference metadata to DynamoDB. No-op locally."""
+def log_to_dynamodb(item: dict):
+    """Write inference metadata to DynamoDB using explicit type descriptors."""
     if not USE_AWS:
         return
-    table = aws["dynamodb"].Table(DYNAMO_TABLE)
-    table.put_item(Item={
-        "detection_id": detection_id,
-        "timestamp":    datetime.now(timezone.utc).isoformat(),
-        "class":        predicted_class,
-        "confidence":   str(round(confidence, 4)),   # Decimal not JSON-safe
-        "action":       ACTION_MAP[predicted_class]["action"],
-        "s3_key":       s3_key or "local",
-        "latency_ms":   str(round(latency_ms, 2)),
-        "device":       str(DEVICE),
-    })
+    try:
+        aws["dynamodb_client"].put_item(
+            TableName=DYNAMO_TABLE,
+            Item={
+                "detection_id":  {"S": item["detection_id"]},
+                "timestamp":     {"S": item["timestamp"]},
+                "class":         {"S": item["class"]},
+                "status":        {"S": item["status"]},
+                "confidence":    {"N": str(item["confidence"])},
+                "action":        {"S": item["action"]},
+                "review_status": {"S": item["review_status"]},
+                "needs_review":  {"BOOL": item["needs_review"]},
+                "s3_key":        {"S": item["s3_key"] or "local"},
+                "latency_ms":    {"N": str(item["latency_ms"])},
+                "device":        {"S": item["device"]},
+            }
+        )
+    except Exception as exc:
+        print(f"[ERROR] DynamoDB put_item failed: {exc}")
+        raise
 
 
 def push_cloudwatch_metrics(predicted_class: str, latency_ms: float):
@@ -146,13 +151,13 @@ def push_cloudwatch_metrics(predicted_class: str, latency_ms: float):
         MetricData=[
             {
                 "MetricName": "InferenceLatencyMs",
-                "Value": latency_ms,
-                "Unit": "Milliseconds",
+                "Value":      latency_ms,
+                "Unit":       "Milliseconds",
             },
             {
                 "MetricName": "DenyEntryCount",
-                "Value": 1 if predicted_class == "WithoutMask" else 0,
-                "Unit": "Count",
+                "Value":      1 if predicted_class == "WithoutMask" else 0,
+                "Unit":       "Count",
             },
         ],
     )
@@ -168,13 +173,11 @@ face_net: cv2.dnn.Net | None = None
 async def lifespan(app: FastAPI):
     global ml_model, face_net, aws
 
-    # Load mask classifier
     print(f"Loading model from: {MODEL_PATH}")
     if not os.path.exists(MODEL_PATH):
         raise RuntimeError(f"Model not found at {MODEL_PATH}")
     ml_model = load_model(MODEL_PATH)
 
-    # Load DNN face detector
     if not os.path.exists(PROTOTXT_PATH) or not os.path.exists(CAFFEMODEL_PATH):
         raise RuntimeError(
             f"DNN face detector files not found.\n"
@@ -184,7 +187,6 @@ async def lifespan(app: FastAPI):
     face_net = cv2.dnn.readNetFromCaffe(PROTOTXT_PATH, CAFFEMODEL_PATH)
     print("DNN face detector loaded.")
 
-    # AWS clients (only when enabled)
     if USE_AWS:
         aws = get_aws_clients()
         print(f"AWS mode ON — region={AWS_REGION}, bucket={S3_BUCKET}, table={DYNAMO_TABLE}")
@@ -212,12 +214,12 @@ def root():
 @app.get("/health", tags=["Health"])
 def health():
     return {
-        "status":         "ok",
-        "model_loaded":   ml_model is not None,
-        "face_detector":  face_net is not None,
-        "device":         str(DEVICE),
-        "aws_mode":       USE_AWS,
-        "classes":        CLASSES,
+        "status":        "ok",
+        "model_loaded":  ml_model is not None,
+        "face_detector": face_net is not None,
+        "device":        str(DEVICE),
+        "aws_mode":      USE_AWS,
+        "classes":       CLASSES,
     }
 
 
@@ -238,10 +240,8 @@ async def predict(file: UploadFile = File(..., description="Face image (JPEG/PNG
     detection_id = str(uuid.uuid4())
     t_start      = time.perf_counter()
 
-    # Face detection & crop
     img = detect_and_crop_face(img, face_net)
 
-    # Inference
     tensor = preprocess(img).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
         logits = ml_model(tensor)
@@ -251,30 +251,47 @@ async def predict(file: UploadFile = File(..., description="Face image (JPEG/PNG
     predicted_class = CLASSES[predicted_idx]
     confidence      = float(probs[predicted_idx])
     latency_ms      = (time.perf_counter() - t_start) * 1000
+    timestamp       = datetime.now(timezone.utc).isoformat()
 
     all_probs = {cls: round(float(p), 4) for cls, p in zip(CLASSES, probs)}
-    business  = ACTION_MAP[predicted_class]
+
+    # ── Confidence-based routing ──────────────────────────────────
+    base_status = "mask_on" if predicted_class == "WithMask" else "mask_off"
+
+    if confidence >= CONFIDENCE_THRESHOLD:
+        action        = "Allow entry"
+        review_status = "automated"
+        needs_review  = False
+    else:
+        action        = "Review Required"
+        review_status = "pending_review"
+        needs_review  = True
+
+    # ── Single result dict — shared by AWS logging and response ───
+    result = {
+        "detection_id":      detection_id,
+        "timestamp":         timestamp,
+        "class":             predicted_class,
+        "status":            base_status,
+        "confidence":        round(confidence, 4),
+        "action":            action,
+        "review_status":     review_status,
+        "needs_review":      needs_review,
+        "all_probabilities": all_probs,
+        "latency_ms":        round(latency_ms, 2),
+        "s3_key":            None,
+        "device":            str(DEVICE),
+    }
 
     # ── AWS side-effects (non-blocking best-effort) ───────────────
-    s3_key = None
     try:
-        s3_key = save_frame_to_s3(raw, detection_id)
-        log_to_dynamodb(detection_id, predicted_class, confidence, s3_key, latency_ms)
+        result["s3_key"] = save_frame_to_s3(raw, detection_id)
+        log_to_dynamodb(result)
         push_cloudwatch_metrics(predicted_class, latency_ms)
     except Exception as exc:
-        # Never fail a prediction because of observability errors
         print(f"[WARN] AWS logging failed: {exc}")
 
-    return JSONResponse({
-        "detection_id":    detection_id,
-        "status":          business["status"],
-        "class":           predicted_class,
-        "confidence":      round(confidence, 4),
-        "action":          business["action"],
-        "all_probabilities": all_probs,
-        "latency_ms":      round(latency_ms, 2),
-        "s3_key":          s3_key,
-    })
+    return JSONResponse(result)
 
 
 if __name__ == "__main__":
