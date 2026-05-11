@@ -277,18 +277,23 @@ async def predict(file: UploadFile = File(..., description="Face image (JPEG/PNG
 
     all_probs = {cls: round(float(p), 4) for cls, p in zip(CLASSES, probs)}
 
-    # ── Confidence-based routing ──────────────────────────────────
-    # Read the module-level constant explicitly — no local shadowing possible
+# ── Confidence-based routing ──────────────────────────────────
     threshold = float(CONFIDENCE_THRESHOLD)
     base_status = "mask_on" if predicted_class == "WithMask" else "mask_off"
 
-    print(f"[DEBUG] predicted_class={predicted_class}, confidence={confidence:.4f}, threshold={threshold}")
-
-    if confidence >= threshold:
+    # Strict Logic:
+    if predicted_class == "WithoutMask":
+        # Always deny entry if the model thinks there is no mask
+        action        = "Deny Entry"
+        review_status = "denied_auto"
+        needs_review  = False
+    elif predicted_class == "WithMask" and confidence >= threshold:
+        # Only allow if mask is on AND we are sure
         action        = "Allow entry"
         review_status = "automated"
         needs_review  = False
     else:
+        # Mask is on but confidence is low, OR any other edge case
         action        = "Review Required"
         review_status = "pending_review"
         needs_review  = True
